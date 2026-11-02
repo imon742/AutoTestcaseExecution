@@ -2,11 +2,11 @@
 import asyncio,base64,json,os,secrets,threading,urllib.parse,webbrowser
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
-from .models import Case,Policy,Budget,select_scope,redact,fingerprint,clean_url
+from .models import Case,Policy,Budget,select_scope,redact,fingerprint,clean_url,SECRET_RE
 from .store import Store
 from .importer import load_file,load_public,load_oauth
 from .ollama import Ollama
-from .auth import WindowsVault,bootstrap
+from .auth import LocalVault,bootstrap
 from .browser import BrowserOwner
 from .supervisor import Supervisor
 from .writers import export_results,result_copy,SheetsOAuth,flush_writebacks
@@ -25,7 +25,7 @@ class Vault:
     def __init__(self):self.fixture=None
     def get(self,name):
         if name=='fixture' and self.fixture:return {'username':self.fixture.username,'password':self.fixture.password}
-        return WindowsVault().get(name)
+        return LocalVault().get(name)
 
 class App:
     def __init__(self):
@@ -33,9 +33,11 @@ class App:
         self.store=Store(PRIVATE/'agent.sqlite3');self.store.recover()
         self.config=json.loads((PRIVATE/'config.json').read_text(encoding='utf-8')) if (PRIVATE/'config.json').exists() else {
           'start_url':'','headless':False,'ollama':{'model':'','context':8192,'timeout':90,'vision':False},
-          'auth':{'mode':'none'},'policy':{'origins':[],'allow_all_origins':True,'categories':['read'],'write_case_ids':[],'fixture_ids':[],
+          'auth':{'mode':'none'},'policy':{'origins':[],'allow_all_origins':False,'categories':['read'],'write_case_ids':[],'fixture_ids':{},
           'upload_root':'','allow_writeback':False},'budget':{'max_actions':20,'case_seconds':240,'action_ms':10000,'locator_retries':1}}
-        self.config['policy'].setdefault('allow_all_origins',True)
+        self.config['policy'].setdefault('allow_all_origins',False)
+        self.config['policy'].setdefault('fixture_ids',{})
+        self.config.setdefault('browser_profile',str(PRIVATE/'browser-profile'))
         self.cases=[];self.source={};self.run_id='';self.busy=False;self.error='';self.lock=threading.RLock()
         self.vault=Vault();self.supervisor=None;self.fixture=None
         self.login_finish=threading.Event();self.login_active=False
@@ -56,13 +58,21 @@ class App:
             'source':{k:v for k,v in self.source.items() if k not in ('token','credentials')},
             'runs':self.store.runs(),'run_id':self.run_id,
             'results':[{k:r.get(k) for k in ('case_id','state','attempt_id','status','actual','started','finished','details')} for r in results],
-            'events':self.store.events(self.run_id) if self.run_id else [],
+            'events':self.store.events(self.run_id) if self.run_id else [],'chat':self.store.chat_history(),
             'writebacks':self.store.pending_writebacks(self.run_id) if self.run_id else []}
     def run(self,scope,scenario,selected):
         chosen=select_scope(self.cases,scope,scenario,selected)
         if not chosen:raise ValueError('No cases match the selected scope.')
         cfg=json.loads(json.dumps(self.config));policy=Policy(**cfg['policy'])
         policy.check_origin(cfg['start_url'])
+        for case in chosen:
+            policy.check_case(case)
+            writes=set(case.categories)-{'read'}
+            if writes:
+                category=sorted(writes)[0]
+                action_hash=fingerprint({'source_hash':case.source_hash,'fixture_id':case.fixture_id,'category':category})
+                if not self.store.approval(case.case_id,case.fixture_id,category,action_hash):
+                    raise ValueError('Side effect needs an exact stored approval for '+case.case_id+' / '+case.fixture_id+' / '+category+'.')
         if not cfg['ollama'].get('model'):raise ValueError('Select an installed local model.')
         if any('sign in' in c.steps.lower() or 'authorized' in c.preconditions.lower() for c in chosen) and cfg.get('auth',{}).get('mode','none')=='none' and not cfg.get('auth_state'):
             raise ValueError('Sign in first: Open browser to sign in, enter the site yourself, then Save signed-in session. No cases were started.')
@@ -85,12 +95,21 @@ class App:
             return
         if self.busy:raise ValueError('Wait for the current job, or Pause/Stop.')
         if cmd=='config':
-            cfg=data['config'];Policy(**cfg['policy'])
+            cfg=data['config'];cfg['policy'].setdefault('allow_all_origins',False);cfg['policy'].setdefault('fixture_ids',{})
+            Policy(**cfg['policy'])
             for origin in cfg['policy']['origins']:Policy([origin]).check_origin(origin)
             self.config=cfg;save(PRIVATE/'config.json',cfg)
         elif cmd=='credential':
-            WindowsVault().save(data['name'],data['username'],data['password'])
+            LocalVault().save(data['name'],data['username'],data['password'])
             # Deliberately never return or persist these values in app config.
+        elif cmd=='approve':
+            case=next((c for c in self.cases if c.case_id==data.get('case_id')),None)
+            if not case:raise ValueError('Choose an imported case before approving it.')
+            category=data.get('category','')
+            if category not in (set(case.categories)-{'read'}):raise ValueError('Approval category is not part of this case.')
+            if data.get('fixture_id')!=case.fixture_id:raise ValueError('Approval fixture does not match the case fixture.')
+            action_hash=fingerprint({'source_hash':case.source_hash,'fixture_id':case.fixture_id,'category':category})
+            self.store.approve(case.case_id,case.fixture_id,category,action_hash,'User approved exact fixture/action through local UI.')
         elif cmd=='import_public':
             self.start_job(lambda:self.assign(*load_public(data['url'],data.get('sheet','Test Cases'))))
         elif cmd=='import_file':
@@ -139,7 +158,7 @@ class App:
         elif cmd=='manual_login':
             self.login_finish.clear()
             async def sign_in():
-                owner=await BrowserOwner(Policy(**self.config['policy']),ROOT/'artifacts'/'agent'/'manual-login',Budget()).open(headless=False)
+                owner=await BrowserOwner(Policy(**self.config['policy']),ROOT/'artifacts'/'agent'/'manual-login',Budget(),self.config.get('browser_profile')).open(headless=False)
                 self.login_active=True
                 try:
                     await owner.page.goto(self.config['start_url'],wait_until='domcontentloaded',timeout=30000)
@@ -152,6 +171,10 @@ class App:
                     page=pages[-1];url=clean_url(page.url)
                     if urllib.parse.urlsplit(url).path.rstrip('/').lower() in ('/login','/signin','/sign-in'):
                         raise ValueError('Still on a login page. Finish signing in and open the target page first.')
+                    ready=self.config.get('session_ready_locator') or self.config.get('auth',{}).get('ready_locator')
+                    if not ready:raise ValueError('Configure a session-ready locator before saving a real-site sign-in session.')
+                    owner.page=page
+                    await owner.locator(ready).wait_for(state='visible',timeout=15000)
                     folder=PRIVATE/'auth';folder.mkdir(exist_ok=True);path=folder/'manual-session.json'
                     await owner.context.storage_state(path=str(path),indexed_db=True)
                     self.config['auth_state']=str(path);self.config['auth']={'mode':'none'};self.config['start_url']=url
@@ -160,7 +183,7 @@ class App:
             self.start_job(lambda:asyncio.run(sign_in()))
         elif cmd=='test_login':
             async def test():
-                owner=await BrowserOwner(Policy(**self.config['policy']),ROOT/'artifacts'/'agent'/'login-check',Budget()).open()
+                owner=await BrowserOwner(Policy(**self.config['policy']),ROOT/'artifacts'/'agent'/'login-check',Budget(),self.config.get('browser_profile')).open()
                 try:
                     await bootstrap(owner,self.config,self.vault)
                     folder=PRIVATE/'auth';folder.mkdir(exist_ok=True)
@@ -170,6 +193,38 @@ class App:
                 finally:await owner.close()
             self.start_job(lambda:asyncio.run(test()))
         else:raise ValueError('Unknown application action.')
+    def chat(self,message):
+        """Map human text to fixed host actions; it never controls Playwright."""
+        message=str(message).strip()
+        if not message or len(message)>4000:raise ValueError('Chat message must be 1–4000 characters.')
+        if SECRET_RE.search(message) or __import__('re').search(r'(?i)\b(password|passcode|jwt|bearer token)\b\s*(is|:|=)',message):
+            self.store.chat_add('user','[Secret-like chat message rejected]')
+            reply='I did not store that message. Enter credentials only in the local OS-vault form or the visible sign-in browser.'
+            self.store.chat_add('assistant',reply);return {'intent':'reject_secret','reply':reply}
+        self.store.chat_add('user',message)
+        lower=message.casefold()
+        if any(x in lower for x in ('what is running','what happened','status','show result')):
+            reply=('No run is selected.' if not self.run_id else 'Run '+self.run_id+' is '+self.store.run(self.run_id)['state']+'. '+str(len(self.store.results(self.run_id)))+' case records are stored locally.')
+            intent='show_result'
+        elif 'pause' in lower:
+            self.action({'action':'pause'});reply='Pause requested. The current case will finish its local commit first.';intent='pause'
+        elif 'stop' in lower:
+            self.action({'action':'stop'});reply='Stop requested. No new case will start.';intent='stop'
+        elif 'open' in lower and ('sign in' in lower or 'login' in lower or 'browser' in lower):
+            self.action({'action':'manual_login'});reply='Opened the local sign-in browser. Sign in there, then say Session ready.';intent='open_signin_browser'
+        elif 'session ready' in lower or 'signed in' in lower:
+            self.action({'action':'finish_login'});reply='The local app will validate and save the current browser session.';intent='session_ready'
+        elif lower.startswith('list') or 'list cases' in lower:
+            reply=str(len(self.cases))+' imported cases are available. Use the case table to review scope and fixtures.';intent='list_cases'
+        elif lower.startswith('resume'):
+            if not self.run_id:reply='Choose a saved run in the dashboard before resuming.';intent='resume'
+            else:self.action({'action':'resume','run_id':self.run_id});reply='Resume requested for '+self.run_id+'.';intent='resume'
+        elif lower.startswith('run'):
+            reply='Review the selected scope and configuration, then use Run matching cases. Chat does not bypass action/fixture approval.';intent='run'
+        else:
+            reply='I can import cases, open the sign-in browser, record Session ready, list cases, show local run status, pause, stop, resume, export, or explain a blocked result. Please use a specific command.';intent='clarify'
+        self.store.chat_add('assistant',reply)
+        return {'intent':intent,'reply':reply}
     def assign(self,cases,source):self.cases=cases;self.source=source
 
 def make_handler(app):
@@ -201,7 +256,10 @@ def make_handler(app):
             try:
                 length=int(self.headers.get('Content-Length','0'))
                 if not 0<length<42_000_000:raise ValueError('Request size invalid.')
-                app.action(json.loads(self.rfile.read(length)));self.reply({'ok':True})
+                data=json.loads(self.rfile.read(length))
+                if self.path=='/api/chat':return self.reply(app.chat(data.get('message','')))
+                if self.path!='/api/action':return self.reply({'error':'Not found'},404)
+                app.action(data);self.reply({'ok':True})
             except Exception as e:self.reply({'error':redact(str(e))},400)
     return Handler
 

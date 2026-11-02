@@ -29,6 +29,31 @@ class WindowsVault:
             return {'username':c.UserName or '', 'password':ctypes.string_at(c.CredentialBlob,c.CredentialBlobSize).decode('utf-16-le')}
         finally:self.api.CredFree(ptr)
 
+class LocalVault:
+    """Use Windows Credential Manager when available, otherwise keyring.
+
+    The fallback stores only OS-managed credential references; it never writes a
+    password into project configuration, SQLite, or a report.
+    """
+    def __init__(self):
+        self.windows = WindowsVault() if os.name == 'nt' else None
+    def save(self,name,username,password):
+        if self.windows:return self.windows.save(name,username,password)
+        try:
+            import keyring
+            keyring.set_password('LocalQA/'+name, 'username', username)
+            keyring.set_password('LocalQA/'+name, 'password', password)
+        except Exception as e:raise Blocked('OS credential vault/keyring could not save this credential.') from e
+    def get(self,name):
+        if self.windows:return self.windows.get(name)
+        try:
+            import keyring
+            username=keyring.get_password('LocalQA/'+name, 'username')
+            password=keyring.get_password('LocalQA/'+name, 'password')
+        except Exception as e:raise AuthRequired('No local OS-vault credential configured.') from e
+        if username is None or password is None:raise AuthRequired('No local OS-vault credential configured.')
+        return {'username':username,'password':password}
+
 async def authenticate(owner,config,vault):
     """Run only configured login steps. No credential values reach the model/log."""
     auth=config.get('auth',{})

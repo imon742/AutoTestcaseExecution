@@ -103,7 +103,8 @@ def load_public(url,sheet='Test Cases'):
     return cases,meta
 
 def load_oauth(client,spreadsheet_id,sheet='Test Cases'):
-    grid=client.read(spreadsheet_id,sheet+'!A1:GR30000')
+    quoted="'"+sheet.replace("'","''")+"'"
+    grid=client.read(spreadsheet_id,quoted+'!A1:GR30000')
     cases,meta=normalize_grid(grid,sheet)
     meta.update(kind='google',spreadsheet_id=spreadsheet_id)
     return cases,meta

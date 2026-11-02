@@ -15,6 +15,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS flows(case_hash TEXT PRIMARY KEY, actions TEXT, assertions TEXT, verified REAL);
         CREATE TABLE IF NOT EXISTS writebacks(id TEXT PRIMARY KEY, attempt_id TEXT UNIQUE, run_id TEXT, case_id TEXT, state TEXT, payload TEXT, error TEXT);
         CREATE TABLE IF NOT EXISTS events(run_id TEXT, at REAL, kind TEXT, message TEXT);
+        CREATE TABLE IF NOT EXISTS chat(id TEXT PRIMARY KEY, at REAL, role TEXT, content TEXT);
+        CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY, at REAL, case_id TEXT, fixture_id TEXT, category TEXT, action_hash TEXT, note TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS one_active_attempt_per_run ON attempts(run_id) WHERE finished IS NULL;
         ''')
     def create_run(self,cases,config,source):
@@ -84,6 +86,13 @@ class Store:
     def event(self,run,kind,message):
         with self.lock:self.db.execute('INSERT INTO events VALUES(?,?,?,?)',(run,time.time(),kind,redact(message)))
     def events(self,run):return [dict(r) for r in self.db.execute('SELECT * FROM events WHERE run_id=? ORDER BY at DESC LIMIT 80',(run,))]
+    def chat_add(self,role,content):
+        with self.lock:self.db.execute('INSERT INTO chat VALUES(?,?,?,?)',(uuid.uuid4().hex,time.time(),role,redact(content)))
+    def chat_history(self):return [dict(r) for r in self.db.execute('SELECT at,role,content FROM chat ORDER BY at DESC LIMIT 60')][::-1]
+    def approve(self,case_id,fixture_id,category,action_hash,note=''):
+        with self.lock:self.db.execute('INSERT INTO approvals VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,time.time(),case_id,fixture_id,category,action_hash,redact(note)))
+    def approval(self,case_id,fixture_id,category,action_hash):
+        return self.db.execute('SELECT 1 FROM approvals WHERE case_id=? AND fixture_id=? AND category=? AND action_hash=? ORDER BY at DESC LIMIT 1',(case_id,fixture_id,category,action_hash)).fetchone() is not None
     def put_flow(self,case_hash,actions,assertions):
         with self.lock:self.db.execute('INSERT OR REPLACE INTO flows VALUES(?,?,?,?)',(case_hash,json.dumps(actions),json.dumps(assertions),time.time()))
     def flow(self,case_hash):

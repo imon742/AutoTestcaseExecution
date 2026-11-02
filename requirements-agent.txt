@@ -5,3 +5,4 @@ google-auth-oauthlib>=1.2.4,<2
 requests>=2.33,<3
 pytest>=9,<10
 websockets>=15,<17
+keyring>=25,<26

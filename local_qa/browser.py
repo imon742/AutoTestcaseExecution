@@ -11,22 +11,34 @@ ACTION_SCHEMA={'type':'object','properties':{
  'reason':{'type':'string'},'alternate':LOCATOR_SCHEMA},'required':['kind','locator','value','category','reason'],'additionalProperties':False}
 
 class BrowserOwner:
-    def __init__(self,policy,folder,budget):
+    def __init__(self,policy,folder,budget,profile_dir=None):
         self.policy=policy;self.folder=Path(folder);self.budget=budget
+        self.profile_dir=Path(profile_dir) if profile_dir else None
         self.folder.mkdir(parents=True,exist_ok=True)
         self.context=None;self.page=None;self.p=None;self.browser=None;self.requests=[]
+        self.active_case=None;self.observed_navigation_urls=set()
     async def open(self,auth_state=None,headless=False):
         from playwright.async_api import async_playwright
         self.p=await async_playwright().start()
-        self.browser=await self.p.chromium.launch(headless=headless)
-        self.context=await self.browser.new_context(storage_state=auth_state,accept_downloads=False)
+        if self.profile_dir:
+            self.profile_dir.mkdir(parents=True,exist_ok=True)
+            self.context=await self.p.chromium.launch_persistent_context(str(self.profile_dir),headless=headless,accept_downloads=False,service_workers='block')
+            self.browser=None
+        else:
+            self.browser=await self.p.chromium.launch(headless=headless)
+            self.context=await self.browser.new_context(storage_state=auth_state,accept_downloads=False,service_workers='block')
         async def boundary(route):
             try:self.policy.check_origin(route.request.url)
             except PermissionError:
                 self.requests.append({'method':route.request.method,'url':clean_url(route.request.url),'blocked':'origin'})
                 await route.abort();return
-            # Approved app origins use normal SPA POST/WebSocket behavior. Safety
-            # is enforced on permitted user actions/fixtures, not all HTTP methods.
+            # A read-only case is structurally incapable of sending a mutation,
+            # apart from an explicitly configured authentication endpoint.
+            if self.active_case and set(self.active_case.categories)=={'read'}:
+                method=route.request.method.upper()
+                if method not in ('GET','HEAD','OPTIONS') and not self.policy.session_auth_allowed(route.request.url):
+                    self.requests.append({'method':method,'url':clean_url(route.request.url),'blocked':'read-only method'})
+                    await route.abort();return
             await route.continue_()
         await self.context.route('**/*',boundary)
         async def socket_boundary(socket):
@@ -37,7 +49,7 @@ class BrowserOwner:
                 self.requests.append({'method':'WEBSOCKET','url':clean_url(socket.url),'blocked':'origin'})
                 await socket.close(code=1008,reason='Outside approved QA origins')
         await self.context.route_web_socket('**/*',socket_boundary)
-        self.page=await self.context.new_page()
+        self.page=next((p for p in self.context.pages if not p.is_closed()),None) or await self.context.new_page()
         return self
     def locator(self,spec):
         by=spec.get('by');name=spec.get('name','')
@@ -60,11 +72,17 @@ class BrowserOwner:
             test_id:e.getAttribute('data-testid')||'',href:e.tagName==='A'?e.getAttribute('href'):'',
             disabled:!!e.disabled,secret:e.type==='password'||/password|token|secret|otp/i.test(e.name||'')
           })).filter(e=>!e.secret)''')
+        await self.capture_navigation_landmarks()
         return {'url':clean_url(self.page.url),'title':await self.page.title(),
                 'elements':[{k:redact(v) if isinstance(v,str) else v for k,v in item.items()} for item in items],
                 'visible_text':redact((await self.page.locator('body').inner_text())[:7000]),
                 'blocked_origins':self.requests[-5:]}
+    async def capture_navigation_landmarks(self):
+        landmarks=await self.page.locator('nav a[href], [role="navigation"] a[href], [aria-label*="breadcrumb" i] a[href]').evaluate_all('(els)=>els.map(e=>e.href)')
+        self.observed_navigation_urls.update(str(x) for x in landmarks)
     async def do(self,case,action):
+        self.active_case=case
+        self.policy.check_fixture_origin(case,self.page.url)
         kind=action.get('kind')
         allowed={'navigate','click','fill','select','check','uncheck','press','scroll','upload_fixture','wait_for','extract','switch_tab','close_dialog','verify','blocked'}
         if kind not in allowed:raise Blocked('Unknown action kind.')
@@ -75,9 +93,9 @@ class BrowserOwner:
             if re.search(r'/(logout|delete|remove|purge)(?:[/?]|$)',url,re.I):
                 raise PermissionError('Mutating endpoint navigation is not permitted.')
             self.policy.check_action(case,action)
-            if action.get('category','read')=='read':
-                links=await self.page.locator('a[href]').evaluate_all('(els)=>els.map(e=>e.href)')
-                if url not in links and url!=self.page.url:raise PermissionError('Read-only navigation must follow an observed page link.')
+            await self.capture_navigation_landmarks()
+            if action.get('category','read')=='read' and not self.policy.approved_read_url(url,self.observed_navigation_urls):
+                raise PermissionError('Read-only navigation needs an approved path or observed navigation landmark.')
             response=await self.page.goto(url,wait_until='domcontentloaded',timeout=self.budget.action_ms)
             if response and response.status>=400:raise Blocked('Navigation returned HTTP '+str(response.status))
             return {'kind':kind,'url':clean_url(self.page.url)}
@@ -106,7 +124,11 @@ class BrowserOwner:
             if action.get('category')=='read' and metadata['tag']!='A' and metadata['role'] not in ('tab','menuitem'):
                 if not re.fullmatch(r'(search|filter|filters|apply filters|next|previous|back|cancel|close|view(?: details)?|details|show.*|expand.*|admin settings)',metadata['text'].strip(),re.I):
                     raise PermissionError('An unknown business button cannot be treated as read-only.')
-            if metadata['href']:self.policy.check_origin(urljoin(self.page.url,metadata['href']))
+            if metadata['href']:
+                target=urljoin(self.page.url,metadata['href']);self.policy.check_origin(target)
+                await self.capture_navigation_landmarks()
+                if action.get('category')=='read' and not self.policy.approved_read_url(target,self.observed_navigation_urls):
+                    raise PermissionError('Read-only links must be approved paths or observed navigation landmarks.')
         self.policy.check_action(case,action,readonly_field)
         timeout=self.budget.action_ms
         if kind=='click':await loc.click(timeout=timeout)

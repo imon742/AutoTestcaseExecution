@@ -92,7 +92,7 @@ class Fixture:
                      {'kind':'fill','locator':{'by':'label','role':'','name':'Password'},'credential':'password'},
                      {'kind':'click','locator':{'by':'role','role':'button','name':'Sign in'}}]},
           'policy':{'origins':[self.origin],'categories':['read','create','edit','delete','upload'],
-                    'write_case_ids':[c.case_id for c in self.cases()], 'fixture_ids':['local-fixture'],
+                    'write_case_ids':[c.case_id for c in self.cases()], 'fixture_ids':{'local-fixture':self.origin},
                     'upload_root':str(upload_root),'allow_writeback':False},'budget':{'max_actions':12,'case_seconds':120,'model_seconds':60,'action_ms':5000,'locator_retries':1}}
     def cases(self):
         nav=action('click','Records','link')

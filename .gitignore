@@ -16,5 +16,9 @@ playwright/.auth/
 credentials*.json
 client_secret*.json
 token*.json
+*-session.json
+*.trace.zip
+*.zip
 exports/
 tests/assistant_generated/
+AutoTestcaseExecution/

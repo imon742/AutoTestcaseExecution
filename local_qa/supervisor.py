@@ -27,6 +27,9 @@ class Supervisor:
         self.store.state(run_id,'Running');self.pause.clear();self.stop.clear()
         owner=None
         try:
+            profile=cfg.get('browser_profile')
+            auth_state=cfg.get('auth_state')
+            owner=await BrowserOwner(policy,self.output/run_id/'browser',budget,profile).open(auth_state=auth_state if auth_state and Path(auth_state).is_file() else None,headless=cfg.get('headless',False))
             while not self.pause.is_set() and not self.stop.is_set():
                 case=self.store.next_case(run_id)
                 if not case:break
@@ -35,19 +38,20 @@ class Supervisor:
                 try:
                     policy.check_case(case)
                     if self.fixtures and cfg['start_url'].startswith(self.fixtures.origin+'/'):self.fixtures.reset()
-                    # Fresh context per case prevents state pollution; exactly one
-                    # Playwright owner exists at a time. Auth is deterministic.
-                    state=cfg.get('auth_state')
-                    owner=await BrowserOwner(policy,folder,budget).open(auth_state=state if state and Path(state).is_file() else None,headless=cfg.get('headless',False))
+                    # One persistent Playwright context owns the full run. Case
+                    # boundaries reset only evidence/checkpoint state, not login.
+                    owner.folder=folder
                     self.store.event(run_id,'case','Starting '+case.case_id)
                     status,actual,details=await asyncio.wait_for(self.execute_case(owner,case,cfg,model,budget),budget.case_seconds)
-                except asyncio.TimeoutError:status='Blocked';actual='Case time budget exceeded; next case will continue.'
+                except asyncio.TimeoutError:
+                    status='NeedsReview' if set(case.categories)-{'read'} else 'Blocked'
+                    actual='Side effect may have partly applied; reconcile the approved fixture before any new run.' if status=='NeedsReview' else 'Case time budget exceeded; next case will continue.'
                 except AuthRequired as e:status='Blocked';actual='AuthRequired: '+str(e)
                 except NeedsReview as e:status='NeedsReview';actual=str(e)
                 except Exception as e:status='Blocked';actual=redact(type(e).__name__+': '+str(e))[:2000]
                 finally:
                     if owner:
-                        evidence=await owner.evidence_end();await owner.close();owner=None
+                        evidence=await owner.evidence_end()
                 self.store.commit(attempt,status,actual,details,evidence,policy.allow_writeback)
                 if self.fixtures and cfg['start_url'].startswith(self.fixtures.origin+'/'):self.fixtures.reset()
                 self.store.event(run_id,'result',case.case_id+': '+status+' — '+actual)
@@ -61,6 +65,8 @@ class Supervisor:
             if owner:await owner.close()
             if self.store.run(run_id)['state']=='Running':self.store.state(run_id,'Paused')
     async def execute_case(self,owner,case,cfg,model,budget):
+        # Authentication may fill a password.  It always happens before trace
+        # collection; replay repair follows the same rule below.
         await bootstrap(owner,cfg,self.vault)
         await owner.evidence_start(owner.folder)
         criteria,authoritative=explicit_criteria(case)
@@ -111,7 +117,11 @@ class Supervisor:
             except Exception:repair=True
             # Repair never replays already committed business side effects.
             if set(case.categories)-{'read'}:raise NeedsReview('A mutating replay failed. Evidence retained; automatic repetition of side effects is prohibited.')
-            await bootstrap(owner,cfg,self.vault);actions=[]
+            await owner.context.tracing.stop(path=str(owner.folder/'before-auth-repair.zip'))
+            await bootstrap(owner,cfg,self.vault)
+            await owner.context.tracing.start(screenshots=True,snapshots=True,sources=False)
+            owner.requests.append({'event':'trace paused for deterministic authentication repair'})
+            actions=[]
         for index in range(budget.max_actions):
             if self.stop.is_set():raise Blocked('Stop requested during case; result/evidence recorded.')
             snapshot=await owner.observe()
