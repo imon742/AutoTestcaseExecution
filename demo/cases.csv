@@ -1,0 +1,6 @@
+Case ID,Instructions,Start Path,Expected Role,Expected Name,Read Only Approved
+DEMO-001,Open the home page and verify its heading.,/,heading,Local QA Demo,yes
+DEMO-002,Open the catalog and verify its heading.,/catalog,heading,Product catalog,yes
+DEMO-003,Open help and verify its heading.,/help,heading,Help center,yes
+DEMO-004,Open status and verify its heading.,/status,heading,Service status,yes
+DEMO-005,Open about and verify its heading.,/about,heading,About this demo,yes

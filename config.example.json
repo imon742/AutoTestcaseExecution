@@ -1,0 +1,10 @@
+{
+  "base_url": "http://127.0.0.1:8765",
+  "approved_read_paths": ["/", "/catalog", "/help", "/status", "/about"],
+  "model": "qwen3:4b-instruct",
+  "headless": false,
+  "case_timeout_seconds": 360,
+  "max_steps": 8,
+  "num_ctx": 8192,
+  "num_gpu": 0
+}
